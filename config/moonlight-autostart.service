@@ -1,0 +1,26 @@
+[Unit]
+Description=Moonlight auto-connect to Sunshine
+Documentation=file:/etc/moonlight-autostart.conf
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+# Do not start before the local console/fbdev exists.
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=XDG_CACHE_HOME=/root/.cache
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/moonlight-autostart
+# Reconnect automatically: a normal quit (or a host reboot) brings the stream
+# back after 15s, which is what a kiosk-style living-room box wants.
+Restart=always
+RestartSec=15
+TimeoutStopSec=8
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

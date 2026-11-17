@@ -1,0 +1,156 @@
+#!/bin/bash
+#
+# Wake the TV over HDMI-CEC at boot and select this box's HDMI input.
+#
+# Everything below is shaped by what this specific set actually does (measured):
+#
+#  * There is no usable presence probe. The TV keeps its CEC block powered in
+#    standby and still answers GIVE_PHYSICAL_ADDR (with phys 0.0.0.0, its own
+#    fixed address), so "got a reply" does not mean "awake"; GIVE_DEVICE_POWER_
+#    STATUS, GIVE_OSD_NAME and GIVE_DEVICE_VENDOR_ID are not answered at all.
+#    The set reports no power state we can read, so a wake-up is simply sent
+#    once per boot - harmless when it is already on this input.
+#  * IMAGE_VIEW_ON does bring it out of standby, but the set needs about 8s to
+#    boot, and an ACTIVE_SOURCE that arrives during that window is dropped: the
+#    TV wakes up on whatever input it remembered. Hence one wake-up followed by
+#    ACTIVE_SOURCE re-asserted across the whole boot window.
+#  * cec-ctl claims the logical address on every run. If the claim has not
+#    completed, the message goes out as "Unregistered" and the TV ignores it,
+#    so every send is checked and retried once.
+#
+set -u
+
+# Mode:
+#   boot    (default, systemd timer) - full sequence at boot: wait for fb0/HPD,
+#           wake the TV, re-assert ACTIVE_SOURCE across the whole ~12s boot window.
+#   stream  (called by moonlight-autostart when a stream is about to start) -
+#           DRM is already up so skip the boot waits, but STILL wake + re-assert:
+#           the TV may have gone to standby or been switched to another input
+#           since boot. Send ACTIVE_SOURCE immediately, then again across the
+#           wake window so a TV coming out of standby still catches it.
+MODE=${1:-boot}
+
+DEV=/dev/cec0
+CONN=/sys/class/drm/card0-HDMI-A-1/status
+# Seconds after IMAGE_VIEW_ON at which ACTIVE_SOURCE is re-asserted. The set
+# boots in ~8s and only honours the message once it is ready to switch inputs.
+# In stream mode the first one goes out immediately (t=0) because the picture is
+# already live; the later ones still cover a TV waking from standby.
+if [ "$MODE" = stream ]; then
+    ASSERT_AT="0 4 8 12"
+else
+    ASSERT_AT="4 8 12"
+fi
+
+log() { printf '%s [cec-tv-wake] %s\n' "$(date '+%F %T')" "$*" >&2; }
+
+# Only one CEC sequence may drive the bus at a time. The boot timer and the
+# stream hook can overlap (e.g. host comes up within the ~12s boot window);
+# without this lock two cec-ctl processes fight over the logical address and
+# messages go out as Unregistered. Non-blocking: if boot is mid-sequence the
+# stream hook just skips - that in-flight sequence already selects our input.
+LOCK=/run/cec-tv-wake.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    log "another CEC sequence is active ($MODE) - skipping"
+    exit 0
+fi
+log "starting CEC sequence (mode=$MODE)"
+
+# The Amlogic AO CEC controller can only transmit once the DRM connector knows
+# its physical address, and that comes from the TV's EDID, so the HDMI link has
+# to be up first.
+for ((i = 0; i < 20; i++)); do
+    [ -c "$DEV" ] && break
+    sleep 1
+done
+if [ ! -c "$DEV" ]; then
+    log "no CEC device at $DEV"
+    exit 0
+fi
+
+# BOOT MODE ONLY: wait until this box's own display pipeline is ready before
+# driving the TV. On this kernel mesondrmfb is only bound ~9s into boot. If
+# ACTIVE_SOURCE switches the TV to our HDMI input before that, the TV lands on a
+# port with no stable signal and shows colour bars / a blank screen - which looks
+# like the TV switched to the "wrong" input. In stream mode DRM is already up,
+# so this is skipped.
+if [ "$MODE" = boot ]; then
+    FB=/sys/class/graphics/fb0/name
+    for ((i = 0; i < 20; i++)); do
+        grep -qi 'mesondrmfb' "$FB" 2>/dev/null && break
+        sleep 1
+    done
+    if grep -qi 'mesondrmfb' "$FB" 2>/dev/null; then
+        log "display pipeline (mesondrmfb) ready - starting CEC wake sequence"
+    else
+        log "mesondrmfb not up after 20s - proceeding with CEC anyway"
+    fi
+
+    # Short courtesy wait for hot-plug detect, then go regardless: plenty of TVs
+    # drop HPD in standby while keeping the CEC line powered. Skipped in stream
+    # mode because a standby TV (HPD low) is exactly the case we must wake.
+    for ((i = 0; i < 10; i++)); do
+        [ "$(cat "$CONN" 2>/dev/null)" = connected ] && break
+        sleep 1
+    done
+    if [ "$(cat "$CONN" 2>/dev/null)" != connected ]; then
+        log "HDMI-A-1 reports not connected - sending CEC anyway (stands keep CEC powered)"
+    fi
+else
+    log "stream mode - display pipeline assumed up, skipping boot waits"
+fi
+
+# The physical address belongs to the port the TV is plugged into (A.B.C.D, one
+# hex digit each). Read it instead of hardcoding 2.0.0.0, so moving the cable to
+# another HDMI port keeps working. 0.0.0.0 means the EDID did not tell us.
+pa=$(timeout 6 cec-ctl -d "$DEV" --show-topology 2>/dev/null |
+     sed -n 's/.*Physical Address *: *\([0-9a-fA-F.]*\).*/\1/p' | head -1)
+
+phys=0x2000
+case "${pa:-}" in
+    "" | 0.0.0.0)
+        log "HDMI physical address unknown - falling back to 0x2000"
+        ;;
+    *)
+        IFS=. read -r a b c d <<< "$pa"
+        if [ -n "${a:-}" ] && [ -n "${b:-}" ] && [ -n "${c:-}" ] && [ -n "${d:-}" ]; then
+            phys=$(printf '0x%x%x%x%x' "$a" "$b" "$c" "$d")
+            log "HDMI physical address $pa -> $phys"
+        else
+            log "cannot parse physical address '$pa' - falling back to 0x2000"
+        fi
+        ;;
+esac
+
+# Send one CEC message and confirm it actually left the box as Playback Device.
+send() {
+    local out
+    out=$(timeout 10 cec-ctl -d "$DEV" --playback --osd-name Moonlight "$@" 2>&1)
+    if printf '%s\n' "$out" | grep -q 'from Unregistered'; then
+        sleep 1
+        out=$(timeout 10 cec-ctl -d "$DEV" --playback --osd-name Moonlight "$@" 2>&1)
+    fi
+    printf '%s\n' "$out" | grep -q 'Transmit from Playback Device'
+}
+
+if send -t 0 --image-view-on; then
+    log "IMAGE_VIEW_ON sent"
+else
+    log "IMAGE_VIEW_ON could not be sent (logical address not claimed?)"
+    exit 0
+fi
+
+prev=0
+for t in $ASSERT_AT; do
+    sleep $((t - prev))
+    prev=$t
+    if send --active-source "phys-addr=$phys"; then
+        log "ACTIVE_SOURCE $phys sent at +${t}s"
+    else
+        log "ACTIVE_SOURCE $phys failed at +${t}s"
+    fi
+done
+
+log "wake-up sequence finished"
+exit 0

@@ -1,0 +1,47 @@
+# Moonlight boot-time auto-connect configuration.
+# Read by /usr/local/bin/moonlight-autostart (sourced as shell).
+
+# "auto" = mDNS discovery of any Sunshine host on the LAN, or a fixed IP.
+HOST=<SUNSHINE_HOST_IP>       # or "auto" for mDNS discovery
+
+# Sunshine application to launch once connected.
+APP=Desktop
+
+# Stream parameters. The stream is ALWAYS 2560x1440 (2K) - WIDTH/HEIGHT go
+# straight to the client and are never derived from the display. OUTPUT only
+# decides the HDMI mode the frame is scanned out in:
+#   2160p/1600p sink -> 3840x2160@60 (upscale by the VPU scaler)
+#   1440p sink       -> 2560x1440@60 (1:1, no scaling)
+#   1080p and below  -> 1920x1080@60 (downscale)
+#   unknown sink     -> 3840x2160@60 (default 4K)
+WIDTH=2560
+HEIGHT=1440
+FPS=60
+BITRATE=32000   # A-B test 2026-11-18: compare with 35M
+CODEC=h265
+
+# Client pairing PIN (4 digits). Used for both the pairing handshake and the
+# Sunshine web API submission below.
+PIN=<PAIRING_PIN>             # 4-digit PIN shown in Sunshine
+
+# Sunshine web UI credentials enable fully automatic pairing: the client PIN is
+# POSTed to https://<host>:47990/api/pin instead of waiting for someone to type
+# it into the web UI. Leave empty for manual pairing.
+SUNSHINE_USER=<WEB_USER>       # Sunshine web UI user, for auto-pairing
+SUNSHINE_PASS=<WEB_PASSWORD>   # Sunshine web UI password
+SUNSHINE_PORT=47990
+
+# Discovery is the fallback for a host that changed address, not the first
+# move: a cached host that answers wins, and only 2 mDNS sweeps are tried.
+DISCOVERY_TRIES=1          # legacy：扫描次数由下面的 watch 循环接管
+RESOLVE_SWEEPS=4           # 每轮后台扫描跑几遍（4 x 8s = 一轮约 33s，全程都在听）
+DISCOVERY_DELAY=6          # 只在 DISCOVERY_TRIES>1 时生效，当前已是死参数
+OUTPUT=auto
+AUDIO_SAMPLES=512
+
+# Idle watchdog: power the box off when nobody streamed for this long.
+# 0 disables it. See /usr/local/bin/idle-poweroff.
+IDLE_POWEROFF_MINUTES=30
+# 1 = also send CEC standby to the TV (off by default: someone may be watching
+# the TV on its own input).
+IDLE_CEC_STANDBY=0

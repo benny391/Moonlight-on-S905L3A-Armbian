@@ -1,0 +1,100 @@
+#!/bin/bash
+# idle-poweroff - shut the box down after a long stretch with no stream.
+#
+# The box has no power button worth reaching for and no reason to stay hot when
+# nobody is streaming, so a watchdog powers it off. "Idle" means: no stream
+# running, no pairing handshake in flight, nobody logged in over SSH, and no
+# hold file. Any of those resets the clock.
+#
+# Tunables (from /etc/moonlight-autostart.conf, all optional):
+#   IDLE_POWEROFF_MINUTES=30   minutes of idleness before poweroff (0 = disabled)
+#   IDLE_CEC_STANDBY=0         1 = also put the TV on standby (usually unwanted:
+#                              someone may be watching the TV's own apps)
+# Hold (temporarily disable):
+#   touch /run/idle-poweroff.hold      # cleared automatically by a reboot
+# Dry run (log the decision, never power off):
+#   IDLE_POWEROFF_DRY_RUN=1 idle-poweroff
+
+CONF=/etc/moonlight-autostart.conf
+MIN=${IDLE_POWEROFF_MINUTES:-30}
+if [ -r "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" 2>/dev/null
+  [ -n "$IDLE_POWEROFF_MINUTES" ] && MIN=$IDLE_POWEROFF_MINUTES
+fi
+
+STATE=/run/idle-poweroff.since
+HOLD=/run/idle-poweroff.hold
+
+# Uptime seconds, not wall clock: an NTP step or a manual date change must not
+# make the box think it has been idle for years (and power off mid-stream).
+now_up() {
+  local u
+  read -r u _ </proc/uptime
+  printf '%s' "${u%%.*}" # /proc/uptime is fractional; bash arithmetic is not
+}
+
+log() { logger -t idle-poweroff "$*"; }
+
+if [ "${MIN:-0}" -le 0 ] 2>/dev/null; then
+  rm -f "$STATE"
+  exit 0
+fi
+LIMIT=$((MIN * 60))
+
+# ---- is the box in use? -----------------------------------------------------
+active=0
+pgrep -f 'moonlight[ ]stream' >/dev/null && active=1
+pgrep -f 'moonlight[ ](pair|list)' >/dev/null && active=1
+[ -e "$HOLD" ] && active=1
+# An SSH login means somebody is working on the box; do not yank it out from
+# under them. (This is also what keeps an automated session alive.)
+if command -v ss >/dev/null 2>&1; then
+  ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -q . && active=1
+fi
+
+if [ "$active" = 1 ]; then
+  [ -e "$STATE" ] && log "activity - idle timer reset"
+  rm -f "$STATE"
+  exit 0
+fi
+
+# ---- idle: how long? --------------------------------------------------------
+if [ ! -f "$STATE" ]; then
+  now_up > "$STATE"
+  log "no stream - starting ${MIN} min idle countdown"
+  exit 0
+fi
+
+since=$(cat "$STATE" 2>/dev/null)
+case $since in
+'' | *[!0-9]*)
+  now_up > "$STATE"
+  exit 0
+  ;;
+esac
+
+elapsed=$(( $(now_up) - since ))
+if (( elapsed < LIMIT )); then
+  exit 0
+fi
+
+msg="no stream for $((elapsed / 60)) min - powering off"
+log "$msg"
+
+# Leave a line on the TV so the reason is visible if someone is looking at it.
+if [ -w /dev/tty1 ]; then
+  printf '\n\n   %s\n\n' "$msg" > /dev/tty1 2>/dev/null
+fi
+
+if [ "${IDLE_CEC_STANDBY:-0}" = 1 ] && command -v cec-ctl >/dev/null 2>&1; then
+  timeout 3 cec-ctl --playback -t 0 --standby >/dev/null 2>&1
+fi
+
+if [ "${IDLE_POWEROFF_DRY_RUN:-0}" = 1 ]; then
+  log "dry run - would power off now"
+  exit 0
+fi
+
+sleep 3
+systemctl poweroff

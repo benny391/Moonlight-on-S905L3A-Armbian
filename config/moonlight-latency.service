@@ -1,0 +1,12 @@
+[Unit]
+Description=Moonlight low-latency runtime tuning (eth0 coalesce / threaded NAPI / sysctl)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/moonlight-latency-apply.sh
+
+[Install]
+WantedBy=multi-user.target

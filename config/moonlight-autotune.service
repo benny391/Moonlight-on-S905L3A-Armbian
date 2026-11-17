@@ -1,0 +1,17 @@
+[Unit]
+Description=Moonlight thermal-aware autotune (CM311-1A / S905L3A)
+Documentation=file:/etc/moonlight-autotune.sh
+
+[Service]
+Type=simple
+# One-shot tuning first, then stay resident as the temperature watchdog.
+ExecStartPre=/etc/moonlight-autotune.sh apply
+ExecStart=/etc/moonlight-autotune.sh daemon
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pin Moonlight IRQs and NAPI to dedicated CPUs
+ConditionPathExists=/proc/irq/24
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/moonlight-irq-affinity.sh
+
+[Install]
+WantedBy=multi-user.target

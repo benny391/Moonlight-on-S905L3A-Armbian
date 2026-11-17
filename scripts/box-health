@@ -1,0 +1,84 @@
+#!/bin/bash
+# box-health - one-shot health report for the CM311-1a streaming box.
+# Read-only: starts nothing, changes nothing, installs nothing.
+# Usage: box-health [--long]   (--long also prints the last DRM stats window)
+
+LONG=0
+[ "$1" = "--long" ] && LONG=1
+
+ok()   { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+head_ "system"
+printf '  kernel %s | %s | up %s\n' "$(uname -r)" "$(hostname)" \
+       "$(uptime -p 2>/dev/null | sed 's/^up //')"
+printf '  ip %s | eth0 %s %s\n' \
+       "$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}')" \
+       "$(ethtool eth0 2>/dev/null | awk -F': ' '/Speed/{print $2}')" \
+       "$(ethtool eth0 2>/dev/null | awk -F': ' '/Duplex/{print $2}')"
+
+head_ "memory"
+CMAT=$(awk '/^CmaTotal/{print $2}' /proc/meminfo)
+CMAF=$(awk '/^CmaFree/{print $2}' /proc/meminfo)
+AVAIL=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)
+printf '  CMA free %d MB / %d MB | MemAvailable %d MB\n' $((CMAF/1024)) $((CMAT/1024)) $((AVAIL/1024))
+if [ "$CMAT" -lt 400000 ]; then
+  bad "CMA total is $((CMAT/1024))MB - expected 512MB. dtb patch lost? See HANDOVER 'CMA' section"
+elif [ $((CMAF/1024)) -lt 40 ]; then
+  warn "CMA free is low ($((CMAF/1024))MB) - a decode session may be leaking; check 'CmaFree' after stopping the service"
+else
+  ok "CMA headroom fine"
+fi
+
+head_ "devices"
+for d in /dev/video0 /dev/dri/card0 /dev/cec0; do
+  if [ -e "$d" ]; then ok "$d"; else bad "$d missing"; fi
+done
+HB=$(cat /sys/class/drm/card0-HDMI-A-1/status 2>/dev/null)
+EDID=$(wc -c < /sys/class/drm/card0-HDMI-A-1/edid 2>/dev/null)
+printf '  HDMI-A-1 %s, kernel EDID %s bytes' "${HB:-?}" "${EDID:-0}"
+if [ "${EDID:-0}" -eq 0 ]; then
+  printf '  (kernel EDID empty -> DDC fallback decides output)\n'
+else
+  printf '\n'
+fi
+
+head_ "services"
+for u in moonlight-autostart cec-tv-wake.timer eth0-streaming-tuning avahi-daemon ssh.socket; do
+  E=$(systemctl is-enabled "$u" 2>/dev/null); A=$(systemctl is-active "$u" 2>/dev/null)
+  if [ "$A" = active ] || [ "$A" = activating ]; then
+    ok "$u  $E/$A"
+  elif [ "$E" = enabled ] && [ "$u" = "ssh.socket" ]; then
+    ok "$u  $E/$A (socket-activated, normal)"
+  else
+    bad "$u  $E/$A"
+  fi
+done
+
+head_ "kernel errors this boot"
+for pat in 'cma_alloc.*alloc failed' 'pll did not lock' 'Reset adapter' 'transmit queue.*timed out'; do
+  N=$(dmesg 2>/dev/null | grep -cE "$pat")
+  if [ "$N" -eq 0 ]; then ok "0 x $pat"; else warn "$N x $pat"; fi
+done
+
+head_ "stream health (last lines)"
+LOG=$(journalctl -u moonlight-autostart -n 400 --no-pager -o cat 2>/dev/null)
+if [ -z "$LOG" ]; then
+  LOG=$(tail -n 400 /var/log/syslog 2>/dev/null | grep -a moonlight-autostart)
+fi
+echo "$LOG" | grep -aE "display (native|unknown)|streaming '|DRM: .*fps at|decode->scanout|decoder stalled|refusing to fall back" | tail -n 6 | sed 's/^/  /'
+if [ "$LONG" = 1 ]; then
+  echo "$LOG" | tail -n 20 | sed 's/^/  /'
+fi
+
+head_ "verdict"
+NPROC=$(pgrep -fc 'moonlight[ ]stream')
+if [ "$NPROC" -gt 0 ]; then
+  ok "a stream is running (pid $(pgrep -f 'moonlight[ ]stream' | tr '\n' ' '))"
+else
+  OK=$(pgrep -fc 'moonlight-autostart')
+  [ "$OK" -gt 0 ] && ok "no stream yet, autostart is waiting for a host" \
+                  || bad "neither moonlight nor autostart is running"
+fi

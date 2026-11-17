@@ -1,0 +1,20 @@
+# Filled-in secrets / host-specific config must never be committed.
+moonlight-autostart.conf
+!moonlight-autostart.conf.example
+uEnv.txt
+!uEnv.txt.example
+
+# Local build / backup artifacts
+*.bak
+*.bak-*
+*.log
+*.orig
+*.rej
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor swap files
+*.swp
+*.swo

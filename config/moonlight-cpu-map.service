@@ -1,0 +1,12 @@
+[Unit]
+Description=Map Moonlight stream threads to dedicated CPU cores
+After=moonlight-irq-affinity.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/moonlight-cpu-map.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

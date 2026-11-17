@@ -1,0 +1,4 @@
+LINUX=/zImage
+INITRD=/uInitrd
+FDT=/dtb/amlogic/meson-g12a-s905l3a-cm311.dtb
+APPEND=root=UUID=<ROOT_UUID> rootflags=compress=zstd:6 rootfstype=btrfs console=ttyAML0,115200n8 no_console_suspend consoleblank=0 fsck.fix=yes fsck.repair=yes net.ifnames=0 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1 video=Composite-1:d

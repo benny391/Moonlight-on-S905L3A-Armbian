@@ -1,0 +1,725 @@
+#!/bin/bash
+#
+# Boot-time Moonlight auto-connect for Armbian / Amlogic boxes.
+#
+#   1. waits for the network, DRM and the V4L2 decoder to come up
+#   2. discovers a Sunshine host on the LAN over mDNS (_nvstream._tcp)
+#   3. pairs it when needed (PIN submitted to Sunshine's web API if credentials
+#      are configured, otherwise printed for manual entry)
+#   4. streams the configured app through VPU + DRM zero-copy
+#   5. never gives up: the host may be off, still booting, or restart Sunshine
+#      underneath a running stream. Nobody is standing next to a living-room
+#      box to press "reconnect", so the loop runs until a stream comes up.
+#
+# Configuration lives in /etc/moonlight-autostart.conf.
+#
+set -u
+
+CONF=${CONF:-/etc/moonlight-autostart.conf}
+
+# defaults, overridable from $CONF
+HOST=auto                       # "auto" or a plain IP address
+APP=Desktop                     # Sunshine application name
+WIDTH=1920
+HEIGHT=1080
+FPS=60
+BITRATE=40000
+CODEC=h265                      # auto | h264 | h265 | av1
+# Audio period in frames (512 ~ 21ms of queued audio). Raise to 1024 if the
+# speakers ever crackle; lower means tighter lip sync, less headroom.
+AUDIO_SAMPLES=512
+# Display mode for the stream: "auto", a fixed "WxH@Hz", or empty to let the
+# client pick the largest mode at >=50Hz that fits the stream.
+#   auto         follow the display: a 1080p panel gets 1080p, a 4K panel 4K
+#   WxH@Hz       force one mode (3840x2160@60 hands the upscale to the VPU)
+#   (empty)      client heuristic, based on the stream size
+OUTPUT=auto
+# The connector whose EDID/DDC decides the auto mode. meson-drm has one HDMI
+# output on this box; keep the path configurable for boards with a different
+# naming.
+DISPLAY_CONN=/sys/class/drm/card0-HDMI-A-1
+PIN=0000                        # default; real value comes from $CONF
+SUNSHINE_USER=                  # Sunshine web UI credentials, for auto-pairing
+SUNSHINE_PASS=
+SUNSHINE_PORT=47990
+DISCOVERY_TRIES=1               # legacy (sweeps per fallback); the watch loop owns repetition
+DISCOVERY_DELAY=6               # legacy; only used when DISCOVERY_TRIES > 1
+# How long one background sweep lives before it is restarted. avahi never
+# returns while the host is absent, so this is a hard cap on the child, not a
+# wait: the next sweep starts the moment this one ends, so coverage is
+# continuous and the value only trades restart overhead against query rate.
+DISCOVERY_TIMEOUT=8
+RESOLVE_SWEEPS=4                # sweeps per round before the round counts as failed
+HOST_CACHE=/root/.cache/moonlight/last-host
+# Polling. A round is a *watch window*, not a sequence of attempts: the mDNS
+# sweep runs in the background while the foreground re-probes the address we
+# already believe in, once a second. Nothing idles, so a host that comes back -
+# on its old address or on a new one - is noticed in about a second instead of
+# after "sweep + probe + retry" (~17s on the old design).
+KNOWN_WAIT_TRIES=1              # legacy: probe passes for the cached host
+PREFERRED_WAIT_TRIES=1          # legacy: probe passes for a configured HOST
+HOST_WAIT_TRIES=1               # re-probe the resolved host before streaming
+DISPLAY_WAIT=15                 # 15 x 2s waiting for HPD before skipping a round
+# Optional secondary shutdown trigger: power off once this many consecutive
+# rounds produced no stream. Off by default, because a round is not a fixed
+# unit of time (~40s with no display, ~33s with the host offline and four
+# discovery sweeps), so the wall-clock watchdog in idle-poweroff.timer is the
+# predictable one. Set it in the conf if counting failures suits you better.
+IDLE_MAX_ROUNDS=${IDLE_MAX_ROUNDS:-0}
+FAST_PROBE_DELAY=1              # poll the known address every 1s while a sweep runs
+POLL_DELAY_UP=2                 # host silent: cheap re-probe, no backoff needed
+POLL_DELAY_BUSY=10              # host busy: back off, it has to time out itself
+RETRY_AFTER_FAIL=1              # breather between rounds (was 5s of pure dead time)
+RECOVER_WAIT_TRIES=20           # 20 x 3s for Sunshine to come back after a restart
+# A healthy host answers `list` in a few seconds; a wedged one never answers, so
+# keep the cap tight - it is the biggest single cost of a recovery.
+PROBE_TIMEOUT=20
+# When the host is stuck on a session that was never closed (the box lost power
+# mid-stream, or a stream was killed), `quit` is the only thing that reaches it:
+# it does not accept new connections but it does honour the teardown. Set to 0
+# if this box shares the host with other clients and must never kick them.
+CLEAR_BUSY_SESSION=1
+# With Sunshine web credentials configured, the stale session can be closed
+# through the web API in about a second instead of waiting for `quit`.
+CLEAR_BUSY_API=1
+# A BUSY host is kicked as soon as detected. Keep a short cooldown ONLY so a
+# restart that fails to clear the session cannot trigger a restart storm.
+CLEAR_COOLDOWN=15
+LAST_CLEAR_AT=0
+AUTH_WARNED=0
+
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+MOONLIGHT=/usr/local/bin/moonlight
+# Thermal-aware tuning helpers. Sourcing is safe: main() is guarded.
+[ -r /etc/moonlight-autotune.sh ] && . /etc/moonlight-autotune.sh
+# Reads the sink's native mode over DDC when the kernel has no EDID for it.
+HDMIC=/usr/local/bin/hdmic
+log() { printf '%s [moonlight-autostart] %s\n' "$(date '+%F %T')" "$*" >&2; }
+
+# Also show the state on the TV: the console login prompt is otherwise the only
+# thing visible while we wait, which looks like a hang.
+notice() {
+    log "$*"
+    printf '\n  >> %s\n' "$*" >/dev/tty1 2>/dev/null || true
+}
+
+warn_bad_credentials() {
+    [ "$AUTH_WARNED" = 1 ] && return 0
+    AUTH_WARNED=1
+    notice "Sunshine API rejected SUNSHINE_USER/SUNSHINE_PASS (HTTP 401/403) - check $CONF"
+}
+
+wait_network() {
+    local i
+    for ((i = 0; i < 90; i++)); do
+        ip -4 route get 1.1.1.1 >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    return 1
+}
+
+wait_path() {
+    local what=$1 path=$2 tries=${3:-120} i
+    for ((i = 0; i < tries; i++)); do
+        [ -e "$path" ] && return 0
+        sleep 1
+    done
+    log "timeout waiting for $what ($path)"
+    return 1
+}
+
+# --- output mode -------------------------------------------------------------
+#
+# "auto" follows whatever is plugged in: a 1080p monitor gets a 1080p signal, a
+# 4K TV gets 4K. Two sources, in this order:
+#
+#   1. /sys/class/drm/<conn>/edid + modes - correct whenever the kernel managed
+#      to read the sink's EDID while probing it.
+#   2. DDC over i2c (hdmic native) - the kernel caches a *null* EDID for the
+#      whole session when the sink was asleep at probe time, and this driver
+#      never re-reads it (writing "detect" to status does not help either). The
+#      DDC link still answers, so the sink's first detailed timing descriptor is
+#      read straight from the monitor's EEPROM.
+#
+# The mode is applied by the streaming client, which is the only process that
+# can: it holds DRM master while it runs. Pre-setting the mode from a shell tool
+# does not survive - the fbdev restore on master release reverts it - and this
+# vendor kernel's OSD/primary plane never scans out at all, so the console
+# cannot light the display either. Only the NV12 video plane produces a picture.
+detect_output_mode() {
+    local modes m w h bw=0 bh=0 out hz
+    # WorkBuddy 2026-11-17: sysfs `edid` is a bin_attribute whose stat size is
+    # 0 on this vendor kernel, so `[ -s edid ]` was ALWAYS false and this whole
+    # modes branch was skipped -> DDC DTD#1 (4K30) -> downgraded to 1080p60.
+    # The readable `modes` file is the authoritative list of sink capabilities.
+    if [ -r "$DISPLAY_CONN/modes" ]; then
+        modes=$DISPLAY_CONN/modes
+        while read -r m; do
+            [[ $m =~ ^([0-9]+)x([0-9]+)$ ]] || continue
+            w=${BASH_REMATCH[1]}
+            h=${BASH_REMATCH[2]}
+            ((w >= 1280 && h >= 720 && w <= 3840 && h <= 2160)) || continue
+            if ((w * h > bw * bh)); then
+                bw=$w
+                bh=$h
+            fi
+        done <"$modes"
+        if ((bw > 0)); then
+            # A 4K panel gets 4K60 only when it actually advertises a
+            # 3840x2160@60 mode. `hdmic list` reads the sink's full mode table
+            # (with refresh rates), unlike DDC DTD#1 which is only 4K30 here.
+            # A genuine 4K30-only sink must NOT be uprated: keep 1080p60 (坑5).
+            if ((bw >= 3840 && bh >= 2160)); then
+                if [ -x "$HDMIC" ] && "$HDMIC" list 2>/dev/null | grep -qE '3840x2160[[:space:]]+@[[:space:]]+60'; then
+                    printf '3840x2160@60\n'
+                else
+                    printf '1920x1080@60\n'
+                fi
+                return 0
+            fi
+            printf '%dx%d@60\n' "$bw" "$bh"
+            return 0
+        fi
+    fi
+    # No EDID for this session: ask the sink itself over DDC.
+    [ -x "$HDMIC" ] || return 1
+    out=$("$HDMIC" native 2>/dev/null)
+    case $out in
+    *x*@*) ;;
+    *) return 1 ;;
+    esac
+    out=${out%% *}
+    hz=${out##*@}
+    # A native mode below 50Hz (a 4K sink behind an HDMI 1.4 link, say) is not
+    # usable for streaming: 1080p60 looks far better than 30Hz at 4K.
+    if ((hz < 50)); then
+        printf '1920x1080@60\n'
+        return 0
+    fi
+    printf '%s\n' "$out"
+}
+
+# `moonlight list` without an address runs mDNS discovery and prints
+# "Connecting to <ip>..." as soon as a server answers.
+# The cheap HTTP side answers even when Sunshine's stream handler is dead, so
+# this is only a liveness/state probe - never proof that streaming will work.
+#
+# The 2s connect timeout matters: a PC that is off does not refuse the
+# connection, it swallows the SYN until the timeout expires, and this probe is
+# the hot path of every retry round.
+host_state() {
+    local ip=$1
+    timeout 3 curl -s --connect-timeout 1 -m 2 \
+        "http://$ip:47989/serverinfo" 2>/dev/null \
+        | sed -n 's:.*<state>\([^<]*\)</state>.*:\1:p'
+}
+
+host_responds() {
+    [ -n "$(host_state "$1")" ]
+}
+
+# Poll a host until it answers at all, without touching the stream handshake.
+wait_host_up() {
+    local ip=$1 tries=${2:-$KNOWN_WAIT_TRIES} i
+    for ((i = 0; i < tries; i++)); do
+        host_responds "$ip" && return 0
+        # Do not sleep after the last probe: the caller is about to start over.
+        [ $((i + 1)) -lt "$tries" ] && sleep "$FAST_PROBE_DELAY"
+    done
+    return 1
+}
+
+wait_host_free() {
+    local ip=$1 i st
+    for ((i = 0; i < RECOVER_WAIT_TRIES; i++)); do
+        st=$(host_state "$ip")
+        [ "$st" = SUNSHINE_SERVER_FREE ] && return 0
+        sleep 3
+    done
+    return 1
+}
+
+discover_host() {
+    local out
+    out=$(timeout "$DISCOVERY_TIMEOUT" stdbuf -o0 -e0 "$MOONLIGHT" list 2>&1)
+    printf '%s\n' "$out" \
+        | grep -oE 'Connecting to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -1 | cut -d' ' -f3
+}
+
+# 0 = paired, 1 = not paired, 2 = host unreachable, 3 = host busy
+#
+# `moonlight list` is the authoritative check: a paired host answers with its
+# app list, an unpaired one prints "You must pair with the PC first". The
+# timeout is generous because the very first run generates an RSA key pair on
+# this SoC, which alone can take 30s.
+#
+# The serverinfo pre-check matters: while Sunshine thinks a session is still
+# running it accepts the TCP connection but never answers, so `list` would burn
+# the full timeout and look exactly like an offline host.
+probe_host() {
+    local ip=$1 out cid state
+    cid=$(cat /root/.cache/moonlight/uniqueid.dat 2>/dev/null)
+    if [ -n "$cid" ] && command -v curl >/dev/null 2>&1; then
+        out=$(timeout 8 curl -s --connect-timeout 2 -m 6 \
+            "http://$ip:47989/serverinfo?uniqueid=$cid" 2>/dev/null)
+        [ -z "$out" ] && return 2
+        state=$(printf '%s' "$out" | sed -n 's:.*<state>\([^<]*\)</state>.*:\1:p')
+        case "$state" in
+            *BUSY*) return 3 ;;
+        esac
+    fi
+    out=$(timeout "$PROBE_TIMEOUT" stdbuf -o0 -e0 "$MOONLIGHT" list "$ip" 2>&1)
+    case "$out" in
+        *"must pair"*) return 1 ;;
+    esac
+    # Only treat it as paired when the app list really came back.
+    printf '%s\n' "$out" | grep -qE '^[0-9]+\. ' && return 0
+    return 2
+}
+
+# Sunshine exposes no supervision of its own, so when its stream handler wedges
+# the only way back is a restart - and the restart kills the connection before
+# it can answer, so a dropped response counts as "it went down as asked".
+# The distinction that matters: 000 with time_connect>0 means the request went
+# out and the host tore the socket down (restart in progress, success), while
+# 000 with time_connect==0 means the host was never reachable and there is
+# nothing to restart. Treating the second case as success used to cost two
+# minutes of pointless waiting on every retry round.
+sunshine_api_restart() {
+    local ip=$1 out code tconn
+    [ -n "$SUNSHINE_USER" ] || return 1
+    out=$(curl -sk --max-time 12 -o /dev/null -w '%{http_code} %{time_connect}' \
+        -u "$SUNSHINE_USER:$SUNSHINE_PASS" \
+        -X POST "https://$ip:$SUNSHINE_PORT/api/restart" 2>/dev/null)
+    code=${out%% *}
+    tconn=${out##* }
+    case "$code" in 401|403) warn_bad_credentials ;; esac
+    [ "$code" = 200 ] && return 0
+    [ "$code" = 000 ] && [ "$tconn" != "0.000000" ] && return 0
+    return 1
+}
+
+# Poke the Sunshine web API: it is the only way to end a session the host still
+# believes in, and with credentials it answers in about a second.
+sunshine_api_close() {
+    local ip=$1 code
+    [ -n "$SUNSHINE_USER" ] || return 1
+    code=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
+        -u "$SUNSHINE_USER:$SUNSHINE_PASS" \
+        -X POST "https://$ip:$SUNSHINE_PORT/api/apps/close" 2>/dev/null)
+    case "$code" in 401|403) warn_bad_credentials ;; esac
+    [ "$code" = 200 ]
+}
+
+# An unclean disconnect (the box drops its link mid-stream) leaves Sunshine in a
+# state it never leaves on its own: /serverinfo keeps answering, but its stream
+# handler is gone, so every new handshake just hangs and it still reports BUSY.
+# Closing the stale session is usually enough; if it is not, the host has to be
+# restarted, which its own web API can do.
+#
+# Only ever called for a host that answered BUSY. A host that does not answer at
+# all is simply off - there is no session to clear and no API to reach.
+recover_host() {
+    local ip=$1 rc
+
+    if [ "$CLEAR_BUSY_API" = 1 ]; then
+        sunshine_api_close "$ip" \
+            && notice "closed the stale session on $ip via the Sunshine API"
+        if sunshine_api_restart "$ip"; then
+            notice "Sunshine on $ip is busy - restarting it via its API"
+            if wait_host_free "$ip"; then
+                probe_host "$ip"
+                rc=$?
+                case $rc in
+                    0 | 1) return 0 ;;
+                esac
+            fi
+        else
+            notice "could not restart Sunshine on $ip via its API"
+        fi
+        notice "host $ip is still busy after the API restart"
+    fi
+
+    notice "host $ip is stuck on an unreleased session - sending quit"
+    timeout 60 stdbuf -o0 -e0 "$MOONLIGHT" quit "$ip" >/dev/null 2>&1
+    sleep 5
+}
+
+submit_pin() {
+    local ip=$1 pin=$2 i
+    local out pid entry matches body response code body_out local_ip name resp_code
+    [ -n "$SUNSHINE_USER" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local_ip=$(ip -4 -o route get "$ip" 2>/dev/null \
+               | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}' \
+               | head -1)
+    name=$(hostname)
+
+    # New Sunshine publishes the pending pairing request on GET /api/pin.
+    # Wait briefly for our own request to appear, then submit the PIN against
+    # that exact pairing_id. Older Sunshine gets the legacy {pin,name} body.
+    for ((i = 0; i < 20; i++)); do
+        out=$(curl -sk --max-time 5 -w '\n%{http_code}' -u "$SUNSHINE_USER:$SUNSHINE_PASS" \
+              "https://$ip:$SUNSHINE_PORT/api/pin" 2>/dev/null)
+        resp_code=${out##*$'\n'}
+        out=${out%$'\n'*}
+        case "$resp_code" in 401|403) warn_bad_credentials ;; esac
+        if [ -n "$local_ip" ]; then
+            matches=$(printf '%s' "$out" | tr '}' '\n' \
+                      | grep -F "\"address\":\"$local_ip\"" \
+                      | grep -cE '"id" *: *"[0-9a-fA-F]{32}"')
+            [ "$matches" -gt 1 ] && return 1
+            [ "$matches" -eq 1 ] && entry=$(printf '%s' "$out" | tr '}' '\n' \
+                      | grep -F "\"address\":\"$local_ip\"" | head -1)
+        fi
+        [ -z "$entry" ] && entry=$(printf '%s' "$out" | tr '}' '\n' \
+                      | grep -E '"id" *: *"[0-9a-fA-F]{32}"' | head -1)
+        pid=$(printf '%s' "$entry" \
+              | sed -n 's/.*"id" *: *"\([0-9a-fA-F]\{32\}\)".*/\1/p')
+        [ -n "$pid" ] && break
+        entry=
+        sleep 1
+    done
+
+    if [ -n "$pid" ]; then
+        body=$(printf '{"pairing_id":"%s","pin":"%s","name":"%s"}' \
+               "$pid" "$pin" "$name")
+        response=$(curl -sk --max-time 10 -w '\n%{http_code}' \
+            -u "$SUNSHINE_USER:$SUNSHINE_PASS" \
+            -H 'Content-Type: application/json' \
+            -X POST "https://$ip:$SUNSHINE_PORT/api/pin" \
+            -d "$body" 2>/dev/null)
+        code=${response##*$'\n'}
+        body_out=${response%$'\n'*}
+        case "$code" in 401|403) warn_bad_credentials ;; esac
+        if [ "$code" = 200 ] && printf '%s' "$body_out" | grep -q '"status" *: *true'; then
+            return 0
+        fi
+    fi
+
+    body=$(printf '{"pin":"%s","name":"%s"}' "$pin" "$name")
+    response=$(curl -sk --max-time 10 -w '\n%{http_code}' \
+        -u "$SUNSHINE_USER:$SUNSHINE_PASS" \
+        -H 'Content-Type: application/json' \
+        -X POST "https://$ip:$SUNSHINE_PORT/api/pin" \
+        -d "$body" 2>/dev/null) || return 1
+    code=${response##*$'\n'}
+    body_out=${response%$'\n'*}
+    case "$code" in 401|403) warn_bad_credentials ;; esac
+    [ "$code" = 200 ] || return 1
+    printf '%s' "$body_out" | grep -q '"status" *: *true'
+}
+
+pair_host() {
+    local ip=$1 pid rc i
+    local PAIR_WAIT_SECONDS=90
+
+    log "not paired with $ip; pairing with PIN $PIN"
+    notice "Moonlight pairing PIN: $PIN - enter it in Sunshine -> PIN if automatic pairing fails"
+    stdbuf -o0 -e0 "$MOONLIGHT" pair -pin "$PIN" "$ip" >/tmp/moonlight-pair.log 2>&1 &
+    pid=$!
+
+    sleep 3
+    if submit_pin "$ip" "$PIN"; then
+        log "PIN submitted to Sunshine web API at $ip:$SUNSHINE_PORT"
+    else
+        log "automatic PIN submission failed; enter PIN $PIN in the Sunshine web UI"
+        printf '\n\n  Moonlight pairing PIN: %s\n  Enter it in Sunshine -> PIN\n\n' \
+            "$PIN" >/dev/tty1 2>/dev/null || true
+    fi
+
+    for ((i = 0; i < PAIR_WAIT_SECONDS; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "pairing with $ip timed out after ${PAIR_WAIT_SECONDS}s"
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        return 1
+    fi
+    wait "$pid"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        log "paired with $ip"
+        return 0
+    fi
+    log "pairing failed (rc=$rc), see /tmp/moonlight-pair.log"
+    return 1
+}
+
+
+# Find a host to talk to. The cached one wins whenever it answers, because it is
+# the one that worked last and Sunshine does not always re-announce itself after
+# a restart. mDNS is the fallback for a host that changed address - it cannot
+# help at all when Sunshine is simply not running, since an inactive service
+# publishes no _nvstream._tcp record, so it must never be the first move.
+# Hunt for a host. This is a watch loop, not a retry loop: while it runs a
+# background mDNS sweep is always in flight AND the address we already believe
+# in is re-probed once a second, so there is no dead time. Whichever way the
+# host comes back - the PC reboots on its old address, or Sunshine appears on a
+# new one - it is noticed within about a second. The round still ends after
+# RESOLVE_SWEEPS sweeps, so the caller can count failures and back off.
+remember_host() {
+    local ip=$1 tmp
+    [ -n "$ip" ] || return 0
+    [ "${HOST:-}" = "$ip" ] && return 0
+
+    tmp="${CONF}.tmp.$$"
+    if [ -r "$CONF" ] && grep -qE '^[[:space:]]*HOST=' "$CONF"; then
+        sed -E "s|^[[:space:]]*HOST=.*|HOST=$ip              # updated by moonlight-autostart after connecting|" \
+            "$CONF" > "$tmp" 2>/dev/null || return 1
+    else
+        printf 'HOST=%s              # updated by moonlight-autostart after connecting\n' "$ip" > "$tmp" || return 1
+    fi
+    chmod --reference="$CONF" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    mv -f "$tmp" "$CONF" 2>/dev/null || return 1
+    HOST=$ip
+    return 0
+}
+
+resolve_host() {
+    local cached pref ip sweeps=0 raw pid
+
+    cached=$(cat "$HOST_CACHE" 2>/dev/null)
+    if [ "$HOST" != auto ]; then
+        # A configured HOST is a preference, not a straitjacket: the sweep keeps
+        # running beside it, so "the host moved to a new address" is still found.
+        pref=$HOST
+    else
+        pref=$cached
+    fi
+    raw=/tmp/.sunshine-sweep.$$
+    : > "$raw" 2>/dev/null || raw=/dev/null
+
+    while [ "$sweeps" -lt "$RESOLVE_SWEEPS" ]; do
+        sweeps=$((sweeps + 1))
+        : > "$raw" 2>/dev/null
+        # The child is `timeout`, so killing the job also kills the sweep.
+        timeout "$DISCOVERY_TIMEOUT" stdbuf -o0 -e0 "$MOONLIGHT" list > "$raw" 2>&1 &
+        pid=$!
+
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ -n "$pref" ] && host_responds "$pref"; then
+                kill "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                rm -f "$raw"
+                log "host $pref is answering"
+                printf '%s' "$pref"
+                return 0
+            fi
+            kill -0 "$pid" 2>/dev/null && sleep "$FAST_PROBE_DELAY"
+        done
+
+        ip=$(grep -oE 'Connecting to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$raw" 2>/dev/null \
+             | head -1 | cut -d' ' -f3)
+        if [ -n "$ip" ]; then
+            rm -f "$raw"
+            log "mDNS found Sunshine host $ip"
+            [ "$ip" != "$pref" ] && notice "using discovered host $ip (preferred: ${pref:-none})"
+            printf '%s' "$ip"
+            return 0
+        fi
+        notice "no Sunshine host yet (sweep $sweeps/$RESOLVE_SWEEPS) - still listening"
+    done
+
+    rm -f "$raw"
+    return 1
+}
+
+main() {
+    local ip attempt rc cleared round=0 d
+
+    wait_network || { log "no network, giving up"; exit 1; }
+    wait_path "DRM device" /dev/dri/card0 120 || exit 1
+    wait_path "video decoder" /dev/video0 120 || exit 1
+    sleep 3   # let avahi-daemon finish probing before the first query
+
+    while :; do
+        round=$((round + 1))
+
+        if (( IDLE_MAX_ROUNDS > 0 && round > IDLE_MAX_ROUNDS )); then
+            notice "$IDLE_MAX_ROUNDS rounds without a stream - powering off"
+            ${POWEROFF_CMD:-systemctl poweroff}
+            sleep 30
+            exit 1
+        fi
+
+        ip=$(resolve_host)
+        if [ -z "$ip" ]; then
+            notice "no Sunshine host on the network yet (round $round) - retrying in ${RETRY_AFTER_FAIL}s"
+            sleep "$RETRY_AFTER_FAIL"
+            continue
+        fi
+        log "using Sunshine host $ip"
+
+        # Fresh boot, a host that rebooted, or a link that died mid-stream: the
+        # host can be free, still coming up, stuck on a session it never tore
+        # down, or wedged outright. Poll it, recovering at most once per round.
+        cleared=0
+        rc=2
+        for ((attempt = 1; attempt <= HOST_WAIT_TRIES; attempt++)); do
+            probe_host "$ip"
+            rc=$?
+            case $rc in
+                0 | 1) break ;;
+                3)
+                    # A BUSY Sunshine is wedged even if a stale local stream
+                    # process is still around, so pgrep must not block recovery.
+                    if [ "$cleared" = 0 ] && [ "$CLEAR_BUSY_SESSION" = 1 ] \
+                       && { [ "$LAST_CLEAR_AT" = 0 ] \
+                            || [ $((SECONDS - LAST_CLEAR_AT)) -ge "$CLEAR_COOLDOWN" ]; }; then
+                        cleared=1
+                        LAST_CLEAR_AT=$SECONDS
+                        recover_host "$ip"
+                        continue
+                    fi
+                    [ $((attempt % 6)) = 1 ] \
+                        && notice "host $ip is busy (attempt $attempt/$HOST_WAIT_TRIES)"
+                    sleep "$POLL_DELAY_BUSY"
+                    ;;
+                *)
+                    # Not answering at all: PC off, asleep, or still booting.
+                    # Cheap 2s re-probe, so the stream starts within seconds of
+                    # Sunshine appearing - do not back off here.
+                    [ $((attempt % 30)) = 1 ] \
+                        && notice "waiting for $ip to answer (attempt $attempt/$HOST_WAIT_TRIES)"
+                    sleep "$POLL_DELAY_UP"
+                    ;;
+            esac
+        done
+
+        if [ "$rc" = 2 ]; then
+            notice "host $ip did not answer this round - starting over"
+            sleep "$RETRY_AFTER_FAIL"
+            continue
+        fi
+
+        if [ "$rc" = 3 ]; then
+            notice "host $ip stayed busy - it will be retried"
+            sleep "$RETRY_AFTER_FAIL"
+            continue
+        fi
+
+        if [ "$rc" = 1 ]; then
+            if ! pair_host "$ip"; then
+                notice "pairing with $ip failed - retrying"
+                sleep "$RETRY_AFTER_FAIL"
+                continue
+            fi
+            sleep 2
+        fi
+
+        # Remember the host that just worked, for the next round's first move.
+        mkdir -p "${HOST_CACHE%/*}" 2>/dev/null
+        printf '%s\n' "$ip" > "$HOST_CACHE" 2>/dev/null
+        if remember_host "$ip"; then
+            log "default Sunshine host updated to $ip in $CONF"
+        else
+            notice "could not update default host in $CONF - cache still points to $ip"
+        fi
+
+        # Nothing to show: with no connected connector drmzero cannot set any
+        # mode ("no connected display"), so the VPU queue overflows and the
+        # client spins on IDR requests forever. Wait for HPD instead of
+        # streaming into the void - a CEC-woken TV needs a few seconds, and a
+        # monitor that is simply switched off should not burn the PC either.
+        if [ "$(cat "$DISPLAY_CONN/status" 2>/dev/null)" != connected ]; then
+            notice "display not connected (HPD low) - waiting up to $((DISPLAY_WAIT * 2))s"
+            for ((d = 0; d < DISPLAY_WAIT; d++)); do
+                sleep 2
+                [ "$(cat "$DISPLAY_CONN/status" 2>/dev/null)" = connected ] && break
+            done
+            if [ "$(cat "$DISPLAY_CONN/status" 2>/dev/null)" != connected ]; then
+                notice "still no display - retrying in ${RETRY_AFTER_FAIL}s"
+                sleep "$RETRY_AFTER_FAIL"
+                continue
+            fi
+            notice "display connected - starting the stream"
+        fi
+
+        # "auto" only decides the output size; the stream itself stays at 2K.
+        # A 4K panel gets 2160p (one upscale by the VPU), anything smaller gets
+        # 1080p (one downscale), and a display we cannot identify defaults to
+        # 4K - that is the common case and the panel will scale it if it has
+        # to. One retry after a second: a sink that was just hot-plugged can
+        # answer DDC a moment later.
+        if [ "$OUTPUT" = auto ]; then
+            native=$(detect_output_mode) || { sleep 1; native=$(detect_output_mode); }
+            if [ -z "$native" ]; then
+                OUTPUT=3840x2160@60
+                notice "display unknown - defaulting to ${OUTPUT}"
+            else
+                h=${native#*x}
+                h=${h%%@*}
+                # Three tiers, each one a single clean scale of the 2K stream:
+                #   1440p panel -> 1440p (1:1, no scaling at all)
+                #   1080p panel -> 1080p (downscale)
+                #   2160p panel -> 4K    (upscale)
+                # Panels between 1440 and 2160 (1600p, 1800p) round up to 4K,
+                # since they have more pixels than a 1440p frame anyway.
+                if (( ${h:-0} >= 1600 )); then
+                    OUTPUT=3840x2160@60
+                elif (( ${h:-0} >= 1440 )); then
+                    OUTPUT=2560x1440@60
+                else
+                    OUTPUT=1920x1080@60
+                fi
+                notice "display native ${native} - output ${OUTPUT}"
+            fi
+        fi
+
+        [ -n "$OUTPUT" ] && export MOONLIGHT_OUTPUT_MODE="$OUTPUT"
+        # Audio period in frames: 512 => SDL/ALSA keeps ~21ms queued, which lines
+        # the TV speakers up with a picture that is one refresh (16.7ms) behind.
+        [ -n "$AUDIO_SAMPLES" ] && export MOONLIGHT_AUDIO_SAMPLES="$AUDIO_SAMPLES"
+
+        notice "streaming '$APP' from $ip (${WIDTH}x${HEIGHT}@${FPS}, $CODEC, ${BITRATE}kbps, out ${OUTPUT:-auto})"
+
+        # Re-assert HDMI-CEC on EVERY stream start, not just at boot. The TV may
+        # have gone to standby or been switched to another input since boot; the
+        # boot-time cec-tv-wake sequence cannot help with that. Fire it in the
+        # background so it never delays the stream: it wakes the TV, reads this
+        # box's physical address from the live topology and sends ACTIVE_SOURCE
+        # so the TV selects the port the cable is actually in. Internal flock
+        # makes it safe if the boot sequence is still running.
+        if [ -x /usr/local/bin/cec-tv-wake ]; then
+            /usr/local/bin/cec-tv-wake stream >/dev/null 2>&1 &
+            notice "CEC stream-start wake/switch triggered (background)"
+        fi
+
+        # exec hands the process over to the stream. When it exits - clean quit,
+        # host reboot, watchdog stall - systemd restarts this script and the
+        # loop above runs again.
+        # Launch at nice -5 with realtime I/O priority. ionice -c1 needs
+        # CAP_SYS_NICE (we are root); fall back to best-effort if refused.
+        # Tier 2 (WorkBuddy 2026-11-17): SCHED_FIFO rtprio 30 only.
+        # Per-thread affinity comes from moonlight-cpu-map.service:
+        # CPU3 network, CPU2 decode/display, CPU1 audio, CPU0 control.
+        # IRQ threads are RT50 and preempt us on their own cores.
+        RT_PREFIX=()
+        if chrt -f 30 /bin/true >/dev/null 2>&1; then
+            RT_PREFIX=(chrt -f 30)
+            log "latency: SCHED_FIFO prio 30; per-thread CPU map by moonlight-cpu-map.service"
+        else
+            log "latency: chrt unavailable (no CAP_SYS_NICE?) - nice/ionice only"
+        fi
+        if ionice -c1 -n0 true >/dev/null 2>&1; then
+            LAUNCH_PREFIX=("${RT_PREFIX[@]}" nice -n -5 ionice -c1 -n0)
+        else
+            log "ionice -c1 unavailable - falling back to -c2 -n0"
+            LAUNCH_PREFIX=("${RT_PREFIX[@]}" nice -n -5 ionice -c2 -n0)
+        fi
+        "${LAUNCH_PREFIX[@]}" stdbuf -o0 -e0 "$MOONLIGHT" stream "$ip" \
+            -width "$WIDTH" -height "$HEIGHT" -fps "$FPS" \
+            -bitrate "$BITRATE" -codec "$CODEC" -app "$APP"
+        exit $?
+    done
+}
+
+# Guarded so the helpers can be sourced by a test harness.
+[ "${BASH_SOURCE[0]}" = "$0" ] && main "$@"

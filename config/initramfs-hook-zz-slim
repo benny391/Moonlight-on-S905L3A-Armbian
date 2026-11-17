@@ -1,0 +1,59 @@
+#!/bin/sh
+# zz-slim: strip headless streaming box initramfs (v3)
+# - Removes plymouth graphics stack, udev hwdb, bootsplash, dhclient.
+# - Iteratively prunes orphan libs by DT_SONAME vs DT_NEEDED until stable.
+# - Keeps dlopen'd glibc NSS modules explicitly.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+  prereqs) prereqs; exit 0;;
+esac
+
+DIR="${1:-$DESTDIR}"
+[ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
+
+# ---- 1) roots definitely not needed on this headless box ----
+rm -rf "$DIR/usr/share/plymouth" \
+       "$DIR/usr/lib/aarch64-linux-gnu/plymouth" \
+       "$DIR/usr/libexec/plymouth" \
+       "$DIR/etc/plymouth" \
+       "$DIR/usr/share/fonts" \
+       "$DIR/scripts/init-bottom/plymouth" \
+       "$DIR/scripts/init-premount/plymouth" \
+       "$DIR/scripts/panic/plymouth"
+rm -f  "$DIR/usr/bin/plymouth" "$DIR/usr/sbin/plymouthd" \
+       "$DIR/usr/lib/firmware/bootsplash.armbian" \
+       "$DIR/usr/lib/udev/hwdb.bin"
+
+# ---- 2) dhclient chain (local btrfs root, no network mount) ----
+rm -f  "$DIR/usr/sbin/dhclient" "$DIR/usr/sbin/dhclient-script" \
+       "$DIR/usr/bin/run-parts" \
+       "$DIR/etc/dhcp/dhclient-exit-hooks.d/rfc3442-classless-routes"
+rm -rf "$DIR/etc/dhcp" "$DIR/var/lib/dhcp"
+
+# ---- 3) iterative orphan-lib pruning, comparing DT_SONAME to DT_NEEDED ----
+LIBDIR="$DIR/usr/lib/aarch64-linux-gnu"
+[ -d "$LIBDIR" ] || exit 0
+
+# glibc loads NSS modules via dlopen - no DT_NEEDED reference exists.
+KEEP='^(libnss_files\.so|libnss_dns\.so|libnss_compat\.so|libnss_systemd\.so|libgcc_s\.so|ld-linux)'
+
+NEEDTMP=$(mktemp)
+for pass in 1 2 3 4 5 6 7 8 9 10; do
+  find "$DIR" \( -type f -o -type l \) -print0 2>/dev/null \
+    | xargs -0 -r readelf -d 2>/dev/null \
+    | sed -n 's/.*NEEDED.*\[\([^]]*\)\].*/\1/p' | sort -u > "$NEEDTMP"
+
+  changed=0
+  for so in "$LIBDIR"/*.so*; do
+    [ -e "$so" ] || continue
+    soname=$(readelf -d "$so" 2>/dev/null | sed -n 's/.*SONAME.*\[\([^]]*\)\].*/\1/p' | head -1)
+    [ -n "$soname" ] || soname=$(basename "$so")
+    grep -qx "$soname" "$NEEDTMP" && continue
+    echo "$soname" | grep -qE "$KEEP" && continue
+    rm -f "$so" && changed=1
+  done
+  [ "$changed" = 0 ] && break
+done
+rm -f "$NEEDTMP"
+exit 0
