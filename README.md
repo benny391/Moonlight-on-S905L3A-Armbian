@@ -1,4 +1,4 @@
-# CM311-1A Moonlight 串流瘦客户端
+# S905L3A Moonlight 串流瘦客户端（CM311-1A / G12A）
 
 把一台百元级安卓电视盒子（CM311-1A / S905L3A / G12A）改造成**开箱即连、零操作的 Moonlight 串流终端**：通电开机后自动发现局域网内的 Sunshine 主机、自动配对、自动串流，掉线或被踢会自动重连。为长时间串流做了硬解、分核、锁频、温控、开机速度和写盘磨损的整套调优。
 
@@ -82,7 +82,7 @@
 ### 步骤
 
 ```bash
-git clone <your-repo-url> && cd cm311-moonlight
+git clone <your-repo-url> && cd s905l3a-moonlight
 # 1. 先填配置（IP / PIN / Sunshine 账号密码 / root UUID）
 cp config/moonlight-autostart.conf.example /tmp/moonlight-autostart.conf
 $EDITOR /tmp/moonlight-autostart.conf
