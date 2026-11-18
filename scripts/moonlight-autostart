@@ -24,6 +24,9 @@ WIDTH=1920
 HEIGHT=1080
 FPS=60
 BITRATE=40000
+# Network packet size in bytes for the video stream. 1440 keeps the UDP
+# datagram (1440 + RTP 12 + UDP 8 + IP 20 = 1480) inside a 1500-byte MTU.
+PACKETSIZE=1440
 CODEC=h265                      # auto | h264 | h265 | av1
 # Audio period in frames (512 ~ 21ms of queued audio). Raise to 1024 if the
 # speakers ever crackle; lower means tighter lip sync, less headroom.
@@ -678,7 +681,7 @@ main() {
         # the TV speakers up with a picture that is one refresh (16.7ms) behind.
         [ -n "$AUDIO_SAMPLES" ] && export MOONLIGHT_AUDIO_SAMPLES="$AUDIO_SAMPLES"
 
-        notice "streaming '$APP' from $ip (${WIDTH}x${HEIGHT}@${FPS}, $CODEC, ${BITRATE}kbps, out ${OUTPUT:-auto})"
+        notice "streaming '$APP' from $ip (${WIDTH}x${HEIGHT}@${FPS}, $CODEC, ${BITRATE}kbps, pkt ${PACKETSIZE}B, out ${OUTPUT:-auto})"
 
         # Re-assert HDMI-CEC on EVERY stream start, not just at boot. The TV may
         # have gone to standby or been switched to another input since boot; the
@@ -716,7 +719,8 @@ main() {
         fi
         "${LAUNCH_PREFIX[@]}" stdbuf -o0 -e0 "$MOONLIGHT" stream "$ip" \
             -width "$WIDTH" -height "$HEIGHT" -fps "$FPS" \
-            -bitrate "$BITRATE" -codec "$CODEC" -app "$APP"
+            -bitrate "$BITRATE" -packetsize "$PACKETSIZE" -codec "$CODEC" \
+            -app "$APP"
         exit $?
     done
 }

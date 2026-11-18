@@ -18,6 +18,7 @@ WIDTH=2560
 HEIGHT=1440
 FPS=60
 BITRATE=32000   # A-B test 2026-11-18: compare with 35M
+PACKETSIZE=1440   # video packet payload; 1480B on the wire stays under a 1500 MTU
 CODEC=h265
 
 # Client pairing PIN (4 digits). Used for both the pairing handshake and the
