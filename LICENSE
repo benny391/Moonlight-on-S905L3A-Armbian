@@ -20,6 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Note: this repository contains only configuration, glue scripts and docs.
-It does not include moonlight-embedded or Sunshine, which are licensed
-separately by their respective upstream projects (Moonlight is GPLv3).
+Note: this repository contains configuration, glue scripts and docs. It does
+not bundle moonlight-embedded or Sunshine binaries. The moonlight-embedded
+this project depends on is a modified build of the upstream project and is
+distributed under its upstream GPL license; the corresponding source is
+available at <FORK_URL>. Sunshine is licensed separately by its upstream
+project.
