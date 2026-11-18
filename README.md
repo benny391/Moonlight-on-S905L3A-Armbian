@@ -1,4 +1,6 @@
-# S905L3A Moonlight 串流瘦客户端（CM311-1A / G12A）
+# Moonlight on S905L3A Armbian
+
+> Moonlight 串流瘦客户端 · 面向 Amlogic S905L3A（G12A）电视盒的 Armbian 调优方案
 
 把一台百元级安卓电视盒子（CM311-1A / S905L3A / G12A）改造成**开箱即连、零操作的 Moonlight 串流终端**：通电开机后自动发现局域网内的 Sunshine 主机、自动配对、自动串流，掉线或被踢会自动重连。为长时间串流做了硬解、分核、锁频、温控、开机速度和写盘磨损的整套调优。
 
