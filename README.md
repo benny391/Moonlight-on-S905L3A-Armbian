@@ -160,7 +160,7 @@ tail -f /var/log/moonlight-autotune.log
 5. **`cpufrequtils` 必须保持 `ENABLE=false`**，否则开机把 governor 改回 schedutil，锁频失效。
 6. **串流参数由用户定，不要擅自改**——当前 `CODEC=h265`、`2560x1440@60`、`OUTPUT=auto`，码率历史上有 25/32/35/40M 的 A/B 测试，以 `config/moonlight-autostart.conf.example` 里的注释为准。
 7. **开机花屏**：定位为电视侧对启动早期信号的响应差异（同盒子换 1080p 显示器不花），不改 U-Boot/内核，详见 [BOOT-AND-FLOWER-SCREEN.md](docs/BOOT-AND-FLOWER-SCREEN.md)。
-8. **显示端延迟靠「提交即覆盖」压到一帧**：旧逻辑会锁死在两个周期（32.7ms）且不自愈；现在默认只保持一帧在飞，撞上未扫出就放弃该帧，延迟落在 9.6–24.9ms。代价是每 2–3 分钟有一轮约 30 秒的成簇丢帧（1.4–1.8%）。**不要**用调 host 帧率的方式去修，详见 [moonlight-overwrite-mode-report.md](reports/moonlight-overwrite-mode-report.md)。
+8. **显示端延迟压到一帧以内（均值 6.4ms）**：旧逻辑会锁死在两个周期（32.7ms）且不自愈；现在默认只保持一帧在飞，撞上未扫出就放弃该帧。之后又发现「拿到帧后还会给解码器白等 8ms 看有没有第二帧」，改掉后延迟从 16–19ms 降到 **6.4ms（中位 4.8，区间 1.4–15.9）**。代价是每 2 分钟有一轮约 30 秒的成簇丢帧（1.5%）。**不要**用调 host 帧率的方式去修，详见 [moonlight-overwrite-mode-report.md](reports/moonlight-overwrite-mode-report.md)。
 
 ---
 
