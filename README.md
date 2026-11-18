@@ -101,7 +101,8 @@ sudo install -m755 moonlight /usr/local/bin/moonlight
 ### 步骤
 
 ```bash
-git clone <your-repo-url> && cd Moonlight-on-S905L3A-Armbian
+git clone https://github.com/benny391/Moonlight-on-S905L3A-Armbian.git
+cd Moonlight-on-S905L3A-Armbian
 # 1. 先填配置（IP / PIN / Sunshine 账号密码 / root UUID）
 cp config/moonlight-autostart.conf.example /tmp/moonlight-autostart.conf
 $EDITOR /tmp/moonlight-autostart.conf
