@@ -27,7 +27,7 @@
 
 - **设备**：CM311-1A 电视盒（E900V22C-D 板型），Amlogic S905L3A（G12A），2GB RAM，eMMC
 - **系统**：Armbian（Ubuntu 22.04 jammy, btrfs 根分区），`ophub` 内核 `5.15.225-ophub`
-- **串流**：moonlight-embedded `2.7.1-master`（**改版自编译**，含 V4L2/dmabuf 零拷贝输出与 HDMI 热切改动，源码见 <FORK_URL>）+ Sunshine
+- **串流**：moonlight-embedded `2.7.1-master`（**改版自编译**，含 V4L2/dmabuf 零拷贝输出与 HDMI 热切改动，源码见 https://github.com/benny391/moonlight-embedded）+ Sunshine
 - **网络**：DHCP（不设静态 IP），mDNS（`_nvstream._tcp`）发现主机
 - **显示**：HDMI，默认输出 3840x2160@60（按连接显示器 EDID 自动选择）
 
@@ -77,9 +77,26 @@
 本项目不含二进制本体，以下组件需另行准备：
 
 - Armbian + `ophub` 5.15 aarch64 内核（含 `CONFIG_DRM_MESON`、`CONFIG_RD_ZSTD`）
-- **`moonlight` 可执行文件：必须用本项目配套的改版**（源码见 <FORK_URL>；上游 `irtimmer/moonlight-embedded` `2.7.1-master` + 本项目的 V4L2/dmabuf 零拷贝与 HDMI 热切改动），编译后放在 `/usr/local/bin/moonlight`。原版不含这些改动，跑不出同样的延迟和画质。
+- **`moonlight` 可执行文件：必须用本项目配套的改版**（源码见 https://github.com/benny391/moonlight-embedded；上游 `irtimmer/moonlight-embedded` `2.7.1-master` + 本项目的 V4L2/dmabuf 零拷贝与 HDMI 热切改动），编译后放在 `/usr/local/bin/moonlight`。原版不含这些改动，跑不出同样的延迟和画质。
 - `sunshine` 主机在局域网内运行
 - 工具：`cec-ctl`（v4l-utils）、`curl`、`avahi-daemon`、`ethtool`
+
+### 编译 moonlight 改版
+
+```bash
+git clone --recurse-submodules https://github.com/benny391/moonlight-embedded.git
+cd moonlight-embedded
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DENABLE_SDL=ON -DENABLE_FFMPEG=ON \
+  -DENABLE_CEC=ON -DENABLE_PULSE=ON -DENABLE_X11=OFF
+cmake --build . -j4
+sudo install -m755 moonlight /usr/local/bin/moonlight
+```
+
+- **`--recurse-submodules` 不能省**：`third_party/moonlight-common-c` 是 submodule，不拉下来 CMake 会在 `nanors/rs.c` 处报「Cannot find source file」。
+- 基础依赖同上游 README，**额外需要 `libdrm-dev` 和 `libswscale-dev`**（配 `-DENABLE_SDL=ON` 时自动检测）。缺 libdrm 会静默退回普通输出路径，缺 libswscale 则硬解输出无法转 NV12→YUV420P。
+- 编译产物需在 `meson-vdec` 可用的内核上运行（本项目的 5.15 ophub 内核）；`/dev/video0` 存在才会走 V4L2 M2M + dmabuf 零拷贝路径。
 
 ### 步骤
 
@@ -134,4 +151,4 @@ tail -f /var/log/moonlight-autotune.log
 
 配置脚本与文档按 MIT 许可发布（见 [LICENSE](LICENSE)）。
 
-本项目依赖的 `moonlight-embedded` 是**修改后自行编译**的版本，遵循其上游 GPL 许可。按 GPL 要求，分发二进制须能提供对应源码——**完整改版源码见 <FORK_URL>**。`sunshine` 本体遵循其自身许可。
+本项目依赖的 `moonlight-embedded` 是**修改后自行编译**的版本（上游 `irtimmer/moonlight-embedded`，**GPL-3.0**）。按 GPL 要求，分发二进制须能提供对应源码——**完整改版源码见 https://github.com/benny391/moonlight-embedded**（改动：新增 `src/video/v4l2m2m.c` + `src/video/drmzero.c` 零拷贝后端）。`sunshine` 本体遵循其自身许可。

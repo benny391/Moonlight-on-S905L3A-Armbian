@@ -22,7 +22,7 @@ SOFTWARE.
 
 Note: this repository contains configuration, glue scripts and docs. It does
 not bundle moonlight-embedded or Sunshine binaries. The moonlight-embedded
-this project depends on is a modified build of the upstream project and is
-distributed under its upstream GPL license; the corresponding source is
-available at <FORK_URL>. Sunshine is licensed separately by its upstream
-project.
+this project depends on is a modified build of the upstream project
+(irtimmer/moonlight-embedded, GPL-3.0); the corresponding source is available
+at https://github.com/benny391/moonlight-embedded. Sunshine is licensed
+separately by its upstream project.
