@@ -4,7 +4,7 @@
 
 把一台百元级安卓电视盒子（CM311-1A / S905L3A / G12A）改造成**开箱即连、零操作的 Moonlight 串流终端**：通电开机后自动发现局域网内的 Sunshine 主机、自动配对、自动串流，掉线或被踢会自动重连。为长时间串流做了硬解、分核、锁频、温控、开机速度和写盘磨损的整套调优。
 
-> 本项目是**这套配置的记录与复刻工具**，不含 Moonlight / Sunshine 本体（见 [依赖](#依赖)）。所有敏感信息（IP、PIN、密码、UUID）均用 `<...>` 占位，部署前按 [配置](#4-配置) 填写。
+> 本项目是**这套配置的记录与复刻工具**，不含 Moonlight / Sunshine 的二进制本体（见 [依赖](#依赖)）。所有敏感信息（IP、PIN、密码、UUID）均用 `<...>` 占位，部署前按 [配置](#4-配置) 填写。
 
 ---
 
@@ -27,7 +27,7 @@
 
 - **设备**：CM311-1A 电视盒（E900V22C-D 板型），Amlogic S905L3A（G12A），2GB RAM，eMMC
 - **系统**：Armbian（Ubuntu 22.04 jammy, btrfs 根分区），`ophub` 内核 `5.15.225-ophub`
-- **串流**：moonlight-embedded `2.7.1-master`（**改版自编译**，含 V4L2/dmabuf 零拷贝输出与 HDMI 热切改动，源码见 https://github.com/benny391/moonlight-embedded）+ Sunshine
+- **串流**：moonlight-embedded `2.7.1-master`（**改版自编译**，含 V4L2/dmabuf 零拷贝输出与 HDMI 热切改动，源码见 [benny391/moonlight-embedded](https://github.com/benny391/moonlight-embedded)）+ Sunshine
 - **网络**：DHCP（不设静态 IP），mDNS（`_nvstream._tcp`）发现主机
 - **显示**：HDMI，默认输出 3840x2160@60（按连接显示器 EDID 自动选择）
 
@@ -57,8 +57,7 @@
 │   ├── moonlight-latency-apply.sh         网络/调度低延迟参数
 │   ├── cec-tv-wake                        CEC 唤醒电视 + 切 HDMI 口
 │   ├── idle-poweroff                      空闲关机看门狗
-│   ├── box-health                         只读健康检查工具
-│   └── hdmic*                             (可选) HDMI 模式查询/切换工具，未纳入安装
+│   └── box-health                         只读健康检查工具
 ├── docs/                          设计与踩坑文档
 │   ├── HANDOVER.md                        完整运维手册（部署/回滚/验证命令）
 │   ├── BOOT-AND-FLOWER-SCREEN.md          开机花屏的定位过程与结论
@@ -77,7 +76,7 @@
 本项目不含二进制本体，以下组件需另行准备：
 
 - Armbian + `ophub` 5.15 aarch64 内核（含 `CONFIG_DRM_MESON`、`CONFIG_RD_ZSTD`）
-- **`moonlight` 可执行文件：必须用本项目配套的改版**（源码见 https://github.com/benny391/moonlight-embedded；上游 `irtimmer/moonlight-embedded` `2.7.1-master` + 本项目的 V4L2/dmabuf 零拷贝与 HDMI 热切改动），编译后放在 `/usr/local/bin/moonlight`。原版不含这些改动，跑不出同样的延迟和画质。
+- **`moonlight` 可执行文件：必须用本项目配套的改版**（源码见 [benny391/moonlight-embedded](https://github.com/benny391/moonlight-embedded)；上游 `irtimmer/moonlight-embedded` `2.7.1-master` + 本项目的 V4L2/dmabuf 零拷贝与 HDMI 热切改动），编译后放在 `/usr/local/bin/moonlight`。原版不含这些改动，跑不出同样的延迟和画质。
 - `sunshine` 主机在局域网内运行
 - 工具：`cec-ctl`（v4l-utils）、`curl`、`avahi-daemon`、`ethtool`
 
@@ -152,4 +151,4 @@ tail -f /var/log/moonlight-autotune.log
 
 配置脚本与文档按 MIT 许可发布（见 [LICENSE](LICENSE)）。
 
-本项目依赖的 `moonlight-embedded` 是**修改后自行编译**的版本（上游 `irtimmer/moonlight-embedded`，**GPL-3.0**）。按 GPL 要求，分发二进制须能提供对应源码——**完整改版源码见 https://github.com/benny391/moonlight-embedded**（改动：新增 `src/video/v4l2m2m.c` + `src/video/drmzero.c` 零拷贝后端）。`sunshine` 本体遵循其自身许可。
+本项目依赖的 `moonlight-embedded` 是**修改后自行编译**的版本（上游 `irtimmer/moonlight-embedded`，**GPL-3.0**）。按 GPL 要求，分发二进制须能提供对应源码——**完整改版源码见 [benny391/moonlight-embedded](https://github.com/benny391/moonlight-embedded)**（改动：新增 `src/video/v4l2m2m.c` + `src/video/drmzero.c` 零拷贝后端）。`sunshine` 本体遵循其自身许可。
