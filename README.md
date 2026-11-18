@@ -23,6 +23,28 @@
 
 ---
 
+## 与上游的关系（为什么是自编译改版）
+
+这里新增的零拷贝后端是 **out-of-tree** 的：没有进入上游 [moonlight-stream/moonlight-embedded](https://github.com/moonlight-stream/moonlight-embedded)，也不再尝试提交 PR。
+
+上游对该项目的定位很明确——moonlight-embedded 只服务**使用厂商私有接口（amcodec、mpp 等）的老式嵌入式设备**；使用标准 V4L2 解码器 + DRM 渲染的设备，维护者的意见是改用 [moonlight-qt](https://github.com/moonlight-stream/moonlight-qt)。原文见 [PR #932](https://github.com/moonlight-stream/moonlight-embedded/pull/932)（同样是 V4L2 解码 + DRM 出图的思路，2026-05 提交、2026-11 关闭）：
+
+> Moonlight Embedded is really just for those old embedded devices that use bespoke decoding/rendering APIs rather than the standard V4L2 stateful/stateless decoder and DRM renderer.
+
+由此带来三条实际约束：
+
+- **必须自行编译**。发行版仓库或上游仓库里的 `moonlight` 没有这些改动，装上去跑不出零拷贝路径，见[编译 moonlight 改版](#编译-moonlight-改版)。
+- **升级靠 rebase**。分支基点固定在上游 `33142e5`（2026-11-11）；上游若改动 `src/sdl.c` / `src/video/sdl.c` / `CMakeLists.txt`，需要自己 rebase，冲突大概率集中在 `src/sdl.c` 那 9 处 DRM 分支。
+- **有更省事的替代**。若目标设备能跑 moonlight-qt（有可用 KMS + EGL），它功能更全（HDR、vsync 可调、统计叠加）且跟得上上游。这套改版的价值在于**完全不需要 Qt 运行时**：一个 150 KB 的二进制直接接管显示，没有 X、没有 Wayland、没有窗口管理器。
+
+已知限制（都是驱动侧决定的，不是实现取舍）：
+
+- **10bit 源会丢色深**：`meson-vdec` 只输出 `NM12`（8bit），没有 P010，驱动内部降采样，HDR 内容能解但褪色成 SDR，不是花屏也不是失败。
+- **AV1 无硬解**：`meson-vdec` 不支持 AV1，选 AV1 时不会走这条零拷贝路径（本项目固定 `CODEC=h265`）。
+- **依赖两件事**：解码器能把 NV12 帧导出为 dma-buf，且 KMS 有能 import dma-buf 的 overlay plane（支持内部缩放更好，本项目 1440p → 4K 就是靠这个白拿的）。
+
+---
+
 ## 硬件与软件环境
 
 - **设备**：CM311-1A 电视盒（E900V22C-D 板型），Amlogic S905L3A（G12A），2GB RAM，eMMC
@@ -95,7 +117,7 @@ sudo install -m755 moonlight /usr/local/bin/moonlight
 
 - **`--recurse-submodules` 不能省**：`third_party/moonlight-common-c` 是 submodule，不拉下来 CMake 会在 `nanors/rs.c` 处报「Cannot find source file」。
 - 基础依赖同上游 README，**额外需要 `libdrm-dev` 和 `libswscale-dev`**（配 `-DENABLE_SDL=ON` 时自动检测）。缺 libdrm 会静默退回普通输出路径，缺 libswscale 则硬解输出无法转 NV12→YUV420P。
-- 编译产物需在 `meson-vdec` 可用的内核上运行（本项目的 5.15 ophub 内核）；`/dev/video0` 存在才会走 V4L2 M2M + dmabuf 零拷贝路径。
+- 编译产物需在 `meson-vdec` 可用的内核上运行（本项目的 5.15 ophub 内核）。**解码节点和 DRM 卡都是自动探测的**：扫描 `/dev/video0..63` 找同时支持 `M2M_MPLANE` 且能解 H.264/HEVC 的节点，扫描 `/dev/dri/card0..15` 找有 CRTC + connector 的卡（会跳过 panfrost 这类纯 GPU 节点）。串流日志里会打印 `V4L2: using ...` 与 `DRM: using ...`，可据此确认走的是哪一对设备。
 
 ### 步骤
 
