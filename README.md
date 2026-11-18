@@ -27,7 +27,7 @@
 
 - **设备**：CM311-1A 电视盒（E900V22C-D 板型），Amlogic S905L3A（G12A），2GB RAM，eMMC
 - **系统**：Armbian（Ubuntu 22.04 jammy, btrfs 根分区），`ophub` 内核 `5.15.225-ophub`
-- **串流**：moonlight-embedded `2.7.1-master`（自带 V4L2/dmabuf 修改）+ Sunshine
+- **串流**：moonlight-embedded `2.7.1-master`（**改版自编译**，含 V4L2/dmabuf 零拷贝输出与 HDMI 热切改动，源码见 <FORK_URL>）+ Sunshine
 - **网络**：DHCP（不设静态 IP），mDNS（`_nvstream._tcp`）发现主机
 - **显示**：HDMI，默认输出 3840x2160@60（按连接显示器 EDID 自动选择）
 
@@ -74,10 +74,10 @@
 
 ### 依赖
 
-本项目**不含**以下组件，需设备上已具备：
+本项目不含二进制本体，以下组件需另行准备：
 
 - Armbian + `ophub` 5.15 aarch64 内核（含 `CONFIG_DRM_MESON`、`CONFIG_RD_ZSTD`）
-- `moonlight` 可执行文件（本项目假定它在 `/usr/local/bin/moonlight`，且已打过 V4L2/dmabuf 硬解补丁）
+- **`moonlight` 可执行文件：必须用本项目配套的改版**（源码见 <FORK_URL>；上游 `irtimmer/moonlight-embedded` `2.7.1-master` + 本项目的 V4L2/dmabuf 零拷贝与 HDMI 热切改动），编译后放在 `/usr/local/bin/moonlight`。原版不含这些改动，跑不出同样的延迟和画质。
 - `sunshine` 主机在局域网内运行
 - 工具：`cec-ctl`（v4l-utils）、`curl`、`avahi-daemon`、`ethtool`
 
@@ -132,4 +132,6 @@ tail -f /var/log/moonlight-autotune.log
 
 ## 许可
 
-配置脚本与文档按 MIT 许可发布（见 [LICENSE](LICENSE)）。`moonlight` / `sunshine` 本体各自遵循其上游许可（Moonlight 为 GPLv3），本项目仅调用它们、不包含其源码。
+配置脚本与文档按 MIT 许可发布（见 [LICENSE](LICENSE)）。
+
+本项目依赖的 `moonlight-embedded` 是**修改后自行编译**的版本，遵循其上游 GPL 许可。按 GPL 要求，分发二进制须能提供对应源码——**完整改版源码见 <FORK_URL>**。`sunshine` 本体遵循其自身许可。
