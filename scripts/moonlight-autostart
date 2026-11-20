@@ -355,7 +355,7 @@ recover_host() {
 
 submit_pin() {
     local ip=$1 pin=$2 i
-    local out pid entry matches body response code body_out local_ip name resp_code
+    local out pid="" entry="" matches body response code body_out local_ip name resp_code
     [ -n "$SUNSHINE_USER" ] || return 1
     command -v curl >/dev/null 2>&1 || return 1
 
@@ -420,21 +420,35 @@ submit_pin() {
 }
 
 pair_host() {
-    local ip=$1 pid rc i
+    local ip=$1 pid rc i real_pin
     local PAIR_WAIT_SECONDS=90
 
-    log "not paired with $ip; pairing with PIN $PIN"
-    notice "Moonlight pairing PIN: $PIN - enter it in Sunshine -> PIN if automatic pairing fails"
+    log "initiating pairing with $ip (Sunshine generates the PIN dynamically)"
+    : > /tmp/moonlight-pair.log
     stdbuf -o0 -e0 "$MOONLIGHT" pair -pin "$PIN" "$ip" >/tmp/moonlight-pair.log 2>&1 &
     pid=$!
 
-    sleep 3
-    if submit_pin "$ip" "$PIN"; then
+    # Sunshine generates a NEW random PIN on every pairing attempt and prints
+    # it in moonlight's output; the PIN from the config file is only a hint and
+    # never matches. Read the real PIN and submit THAT to the Sunshine API.
+    real_pin=""
+    for ((i = 0; i < 30; i++)); do
+        real_pin=$(sed -nE 's/.*[Pp][Ii][Nn][^0-9]*([0-9]{4})[^0-9]*$/\1/p' \
+                   /tmp/moonlight-pair.log 2>/dev/null | head -1)
+        [ -n "$real_pin" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    [ -z "$real_pin" ] && real_pin="$PIN"
+    log "pairing PIN for $ip: $real_pin (config value $PIN is only a hint)"
+    notice "Moonlight pairing PIN: $real_pin - enter it in Sunshine -> PIN if automatic pairing fails"
+
+    if submit_pin "$ip" "$real_pin"; then
         log "PIN submitted to Sunshine web API at $ip:$SUNSHINE_PORT"
     else
-        log "automatic PIN submission failed; enter PIN $PIN in the Sunshine web UI"
+        log "automatic PIN submission failed; enter PIN $real_pin in the Sunshine web UI"
         printf '\n\n  Moonlight pairing PIN: %s\n  Enter it in Sunshine -> PIN\n\n' \
-            "$PIN" >/dev/tty1 2>/dev/null || true
+            "$real_pin" >/dev/tty1 2>/dev/null || true
     fi
 
     for ((i = 0; i < PAIR_WAIT_SECONDS; i++)); do
