@@ -39,7 +39,7 @@
 
 已知限制（都是驱动侧决定的，不是实现取舍）：
 
-- **10bit 源会丢色深**：`meson-vdec` 只输出 `NM12`（8bit），没有 P010，驱动内部降采样，HDR 内容能解但褪色成 SDR，不是花屏也不是失败。
+- **10bit 源会锁死整机，不要碰**：`meson-vdec` 只输出 `NM12`（8bit），没有 P010；喂 **HEVC Main10** 进去会在解码器内部把 SoC 打死（ARP 不回、无 panic、只能拔电）。**Sunshine 里不要开 Main10 / HDR**，实测过程与源码可疑点见 [10bit-hang.md](docs/10bit-hang.md)。
 - **AV1 无硬解**：`meson-vdec` 不支持 AV1，选 AV1 时不会走这条零拷贝路径（本项目固定 `CODEC=h265`）。
 - **依赖两件事**：解码器能把 NV12 帧导出为 dma-buf，且 KMS 有能 import dma-buf 的 overlay plane（支持内部缩放更好，本项目 1440p → 4K 就是靠这个白拿的）。
 
@@ -83,6 +83,7 @@
 ├── docs/                          设计与踩坑文档
 │   ├── HANDOVER.md                        完整运维手册（部署/回滚/验证命令）
 │   ├── BOOT-AND-FLOWER-SCREEN.md          开机花屏的定位过程与结论
+│   ├── 10bit-hang.md                      HEVC Main10 锁死整机的实测与原因
 │   └── TUNING-NOTES.md                    调优决策与踩坑记录（PLL/网卡 watchdog 等）
 └── reports/                       调优过程中的实测报告
     ├── moonlight-latency-report.md
@@ -161,6 +162,7 @@ tail -f /var/log/moonlight-autotune.log
 6. **串流参数由用户定，不要擅自改**——当前 `CODEC=h265`、`2560x1440@60`、`OUTPUT=auto`，码率历史上有 25/32/35/40M 的 A/B 测试，以 `config/moonlight-autostart.conf.example` 里的注释为准。
 7. **开机花屏**：定位为电视侧对启动早期信号的响应差异（同盒子换 1080p 显示器不花），不改 U-Boot/内核，详见 [BOOT-AND-FLOWER-SCREEN.md](docs/BOOT-AND-FLOWER-SCREEN.md)。
 8. **显示端延迟压到一个周期以内（游戏段 3.5–5.9ms）**：旧逻辑会锁死在两个周期（32.7ms）且不自愈；现在默认只保持一帧在飞，撞上未扫出就放弃该帧。之后又发现「拿到帧后还会给解码器白等 8ms 看有没有第二帧」，改掉后延迟从 16–19ms 降到 **6.4ms 均值**，最近一场游戏段实测 **3.5–5.9ms**。丢帧率取决于 host：host 死锁 60.000fps 时每约 120 秒出现一轮约 30 秒的成簇丢帧（1.5%，实测 139ppm 相位漂移）；host 帧率浮动时锯齿消失，只丢 0.08%。**不要**用调 host 帧率的方式去修，详见 [moonlight-overwrite-mode-report.md](reports/moonlight-overwrite-mode-report.md)。
+9. **永远不要把 Main10 流打开**：host 一旦按 HEVC Main10 发流，盒子会在开流几秒内**整机锁死**（无 panic、无 watchdog、ARP 不回，只能拔电）；同一颗解码器解 8bit 完全正常。这不是配置问题，是 mainline 的 10bit 路径（MMU + FBC）没跑通。实测过程、源码可疑点、取证通道为何全不通，见 [10bit-hang.md](docs/10bit-hang.md)。
 
 ---
 
